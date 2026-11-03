@@ -1,0 +1,107 @@
+name: Publish verified installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, such as v1.2.3
+        required: true
+        type: string
+      title:
+        description: Public release title
+        required: true
+        type: string
+      notes:
+        description: Public release notes in Markdown
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_TITLE: ${{ inputs.title }}
+      RELEASE_NOTES: ${{ inputs.notes }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download verified installer artifacts and generate checksums
+        env:
+          ARTIFACT_URLS: ${{ secrets.RELEASE_ARTIFACT_URLS }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures, hashlib, json, os, pathlib, re, tempfile, urllib.request, zipfile
+          tag = os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag):
+              raise RuntimeError('Invalid release tag')
+          metadata = json.loads(os.environ['ARTIFACT_URLS'])
+          if metadata['tag'] != tag:
+              raise RuntimeError('Artifact metadata belongs to another release')
+          version = tag[1:]
+          groups = {
+              'installers-mac-arm64': {f'jianba-{version}-mac-arm64.{ext}' for ext in ['dmg', 'zip']},
+              'installers-mac-x64': {f'jianba-{version}-mac-x64.{ext}' for ext in ['dmg', 'zip']},
+              'installers-windows-x64': {f'jianba-{version}-windows-x64-setup.exe'},
+          }
+          if len(metadata['artifacts']) != 3 or {a['name'] for a in metadata['artifacts']} != set(groups):
+              raise RuntimeError('All three verified platform artifacts are required')
+          output = pathlib.Path('installers')
+          output.mkdir()
+          def download(artifact):
+              name = artifact['name']
+              with tempfile.NamedTemporaryFile(suffix='.zip') as archive:
+                  try:
+                      with urllib.request.urlopen(artifact['url'], timeout=120) as response:
+                          while chunk := response.read(1024 * 1024):
+                              archive.write(chunk)
+                  except Exception as error:
+                      raise RuntimeError('Artifact download failed: ' + name + ' (' + type(error).__name__ + ')') from None
+                  archive.flush()
+                  digest = artifact.get('digest')
+                  if digest and hashlib.file_digest(open(archive.name, 'rb'), 'sha256').hexdigest() != digest.removeprefix('sha256:'):
+                      raise RuntimeError('Artifact digest mismatch: ' + name)
+                  with zipfile.ZipFile(archive.name) as bundle:
+                      files = [item for item in bundle.infolist() if not item.is_dir()]
+                      if len(files) != len(groups[name]) or {item.filename for item in files} != groups[name]:
+                          raise RuntimeError('Unexpected artifact contents: ' + name)
+                      for item in files:
+                          if item.file_size < 1024 * 1024:
+                              raise RuntimeError('Invalid installer size: ' + item.filename)
+                          with bundle.open(item) as source, (output / item.filename).open('wb') as target:
+                              while chunk := source.read(1024 * 1024):
+                                  target.write(chunk)
+              print('Verified installer artifact: ' + name)
+          with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+              list(pool.map(download, metadata['artifacts']))
+          expected = set().union(*groups.values())
+          if {file.name for file in output.iterdir()} != expected:
+              raise RuntimeError('The five expected installers are not all present')
+          checksums = []
+          for file in sorted(output.iterdir()):
+              with file.open('rb') as data:
+                  checksums.append(hashlib.file_digest(data, 'sha256').hexdigest() + '  ' + file.name)
+          (output / 'SHA256SUMS.txt').write_text('\n'.join(checksums) + '\n')
+          pathlib.Path('release-notes.md').write_text(os.environ['RELEASE_NOTES'])
+          print('Ready to publish ' + tag + ' from verified source commit ' + metadata['sourceCommit'])
+          PY
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          else
+            gh release create "$RELEASE_TAG" --target main --draft --title "$RELEASE_TITLE" --notes-file release-notes.md
+          fi
+          gh release upload "$RELEASE_TAG" installers/* --clobber
+          gh release edit "$RELEASE_TAG" --title "$RELEASE_TITLE" --notes-file release-notes.md --draft=false --latest
